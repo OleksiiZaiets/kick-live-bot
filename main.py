@@ -2,8 +2,12 @@ import os
 import time
 import requests
 
-KICK_USERNAME = os.getenv("kie11")
-DISCORD_WEBHOOK_URL = os.getenv("https://discord.com/api/webhooks/1472986837650767996/IHPq7nPzZBERorKbHCwdhV0bRnIigMHgtoSwP1T0Z-craj6nWuyChVot5x4ymCdaND8N")
+KICK_USERNAME = os.getenv("KICK_USERNAME")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+
+if not KICK_USERNAME or not DISCORD_WEBHOOK_URL:
+    raise SystemExit("Missing env vars: KICK_USERNAME and/or DISCORD_WEBHOOK_URL")
+    
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 
 was_live = False
