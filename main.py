@@ -12,7 +12,9 @@ ROLE_ID = os.getenv("ROLE_ID", "").strip()
 KICK_CLIENT_ID = os.getenv("KICK_CLIENT_ID", "").strip()
 KICK_CLIENT_SECRET = os.getenv("KICK_CLIENT_SECRET", "").strip()
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+# ✅ Variant B: less frequent checks (default 180s, minimum 120s)
+CHECK_INTERVAL = max(120, int(os.getenv("CHECK_INTERVAL", "180")))
+
 PORT = int(os.getenv("PORT", "10000"))
 OFFLINE_RESET_SECONDS = int(os.getenv("OFFLINE_RESET_SECONDS", "300"))  # 5 min default
 
@@ -99,11 +101,6 @@ def ping_prefix() -> str:
 
 
 def send_discord(content: str, embed: dict | None = None) -> int:
-    """
-    Sends a Discord webhook message with:
-    - headers
-    - retry/backoff for 429 and Cloudflare 1015 HTML pages
-    """
     payload = {"content": content}
     if embed:
         payload["embeds"] = [embed]
@@ -119,7 +116,6 @@ def send_discord(content: str, embed: dict | None = None) -> int:
 
     r = _post()
 
-    # Rate limited (Discord 429 JSON or Cloudflare 1015 HTML)
     if r.status_code == 429:
         retry_after = 30.0
         text = (r.text or "")[:500]
@@ -128,9 +124,8 @@ def send_discord(content: str, embed: dict | None = None) -> int:
             js = r.json()
             retry_after = float(js.get("retry_after", retry_after))
         except Exception:
-            # Cloudflare page often includes these phrases
             if "Error 1015" in text or "You are being rate limited" in text or "Access denied" in text:
-                retry_after = 300.0  # 5 minutes
+                retry_after = 300.0
 
         print(f"DEBUG Discord 429. Sleeping {retry_after}s then retrying once...", flush=True)
         time.sleep(retry_after)
@@ -146,7 +141,6 @@ def build_message(channel: dict):
     stream = channel.get("stream") or {}
     is_live = bool(stream.get("is_live"))
 
-    # session_key only if live (avoid "0001-01-01..." confusion)
     session_key = (stream.get("start_time") or "").strip() if is_live else None
 
     title = (channel.get("stream_title") or "").strip()
@@ -171,7 +165,6 @@ def build_message(channel: dict):
     return is_live, session_key, content, embed
 
 
-# ------------------- ROUTES -------------------
 @app.get("/")
 def home():
     return "kick-live-bot is running", 200
@@ -212,10 +205,6 @@ def test():
 
 @app.get("/force")
 def force():
-    """
-    Forces sending the LIVE embed regardless of session logic.
-    If the channel is offline, it will still send a message (use carefully).
-    """
     try:
         ch = fetch_channel_official()
         _, _, content, embed = build_message(ch)
@@ -249,7 +238,6 @@ def callback():
     return {"ok": True, "note": "callback endpoint exists (not used in client_credentials)"}, 200
 
 
-# ------------------- BOT LOOP -------------------
 def bot_loop():
     global announced_this_session, offline_since, last_session_key
     global last_poll, last_error, last_live
