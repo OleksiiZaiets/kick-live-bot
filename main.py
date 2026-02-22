@@ -16,11 +16,13 @@ if not KICK_USERNAME or not DISCORD_WEBHOOK_URL:
 
 app = Flask(__name__)
 
+
 @app.get("/")
 def home():
     return "kick-live-bot is running", 200
 
-# ✅ TEST ENDPOINT
+
+# ✅ TEST ENDPOINT (checks Discord webhook without needing a stream)
 @app.get("/test")
 def test():
     kick_url = f"https://kick.com/{KICK_USERNAME}"
@@ -28,6 +30,25 @@ def test():
     payload = {"content": f"{ping}🧪 TEST ALERT\n{kick_url}"}
     r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
     return f"sent: {r.status_code}", 200
+
+
+# ✅ DEBUG ENDPOINT (checks what Kick API currently returns)
+@app.get("/debug")
+def debug():
+    try:
+        data = fetch_channel()
+        livestream = data.get("livestream")
+        is_live = isinstance(livestream, dict) and livestream.get("id") is not None
+
+        return {
+            "kick_username": KICK_USERNAME,
+            "is_live": is_live,
+            "live_id": (livestream or {}).get("id"),
+            "session_title": (livestream or {}).get("session_title") or (livestream or {}).get("title"),
+            "categories": (livestream or {}).get("categories"),
+        }, 200
+    except Exception as e:
+        return {"error": repr(e)}, 500
 
 
 announced_this_session = False
@@ -87,7 +108,7 @@ def bot_loop():
             livestream = data.get("livestream")
             is_live = isinstance(livestream, dict) and livestream.get("id") is not None
 
-            # ✅ DEBUG LOG
+            # ✅ DEBUG LOG (you'll see this in Render Logs)
             print("DEBUG is_live:", is_live, "live_id:", (livestream or {}).get("id"))
 
             now = time.time()
@@ -95,13 +116,13 @@ def bot_loop():
             if is_live:
                 live_id, content, embed = build_message(data)
 
-                # If offline long enough → treat as new session
+                # If offline long enough -> treat as a new session
                 if offline_since and (now - offline_since >= OFFLINE_RESET_SECONDS):
                     announced_this_session = False
 
                 offline_since = None
 
-                # Announce once per session
+                # Announce once per detected live session (even if bot starts after stream began)
                 if not announced_this_session:
                     print("DEBUG sending discord alert...")
                     send_discord(content, embed)
@@ -111,7 +132,6 @@ def bot_loop():
                 # Start offline timer
                 if offline_since is None:
                     offline_since = now
-
                 announced_this_session = False
 
         except Exception as e:
