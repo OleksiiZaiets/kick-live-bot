@@ -2,8 +2,9 @@ import os
 import time
 import threading
 import requests
-from flask import Flask
+from flask import Flask, request
 
+# ------------------- ENV -------------------
 KICK_USERNAME = os.getenv("KICK_USERNAME", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 ROLE_ID = os.getenv("ROLE_ID", "").strip()
@@ -13,7 +14,7 @@ KICK_CLIENT_SECRET = os.getenv("KICK_CLIENT_SECRET", "").strip()
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 PORT = int(os.getenv("PORT", "10000"))
-OFFLINE_RESET_SECONDS = int(os.getenv("OFFLINE_RESET_SECONDS", "300"))  # 5 хв дефолт
+OFFLINE_RESET_SECONDS = int(os.getenv("OFFLINE_RESET_SECONDS", "300"))  # 5 min default
 
 if not KICK_USERNAME or not DISCORD_WEBHOOK_URL:
     raise SystemExit("Missing env vars: KICK_USERNAME and/or DISCORD_WEBHOOK_URL")
@@ -23,16 +24,14 @@ if not KICK_CLIENT_ID or not KICK_CLIENT_SECRET:
 
 app = Flask(__name__)
 
-# ---------- Token cache ----------
+# ------------------- KICK TOKEN CACHE -------------------
 _kick_token = None
 _kick_token_exp = 0  # epoch seconds
+
 
 def get_app_token() -> str:
     """
     App Access Token (client_credentials)
-    POST https://id.kick.com/oauth/token
-    grant_type=client_credentials
-    Docs: Kick OAuth server is hosted on id.kick.com and supports client_credentials. :contentReference[oaicite:2]{index=2}
     """
     global _kick_token, _kick_token_exp
 
@@ -46,10 +45,12 @@ def get_app_token() -> str:
         "client_id": KICK_CLIENT_ID,
         "client_secret": KICK_CLIENT_SECRET,
     }
-    r = requests.post(url, data=data, timeout=20)
-    r.raise_for_status()
-    js = r.json()
 
+    r = requests.post(url, data=data, timeout=20)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Kick token error {r.status_code}: {r.text}")
+
+    js = r.json()
     token = js.get("access_token")
     expires_in = int(js.get("expires_in", 3600))
 
@@ -60,11 +61,10 @@ def get_app_token() -> str:
     _kick_token_exp = now + expires_in
     return _kick_token
 
+
 def fetch_channel_official():
     """
     Official Kick Public API: GET /public/v1/channels?slug=...
-    (requires Bearer token)
-    Channels docs exist in Kick Dev Docs. :contentReference[oaicite:3]{index=3}
     """
     token = get_app_token()
     url = "https://api.kick.com/public/v1/channels"
@@ -72,29 +72,37 @@ def fetch_channel_official():
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
     r = requests.get(url, params=params, headers=headers, timeout=20)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"Kick API error {r.status_code}: {r.text}")
+
     js = r.json()
     data = js.get("data") or []
     if not data:
         raise RuntimeError(f"No channel data returned for slug={KICK_USERNAME}: {js}")
+
     return data[0]
+
 
 def ping_prefix() -> str:
     return f"<@&{ROLE_ID}> " if ROLE_ID else ""
 
-def send_discord(content: str, embed: dict | None = None):
+
+def send_discord(content: str, embed: dict | None = None) -> int:
     payload = {"content": content}
     if embed:
         payload["embeds"] = [embed]
+
     r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"Discord webhook error {r.status_code}: {r.text}")
     return r.status_code
+
 
 def build_message(channel: dict):
     stream = channel.get("stream") or {}
     is_live = bool(stream.get("is_live"))
 
-    # session key: start_time is good to separate sessions
+    # ✅ IMPORTANT: session_key only if live (so no "0001-01-01...")
     session_key = (stream.get("start_time") or "").strip() if is_live else None
 
     title = (channel.get("stream_title") or "").strip()
@@ -118,16 +126,24 @@ def build_message(channel: dict):
 
     return is_live, session_key, content, embed
 
-# ---------- Routes ----------
+
+# ------------------- ROUTES -------------------
 @app.get("/")
 def home():
     return "kick-live-bot is running", 200
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "kick_username": KICK_USERNAME}, 200
+
 
 @app.get("/test")
 def test():
     kick_url = f"https://kick.com/{KICK_USERNAME}"
     status = send_discord(f"{ping_prefix()}🧪 TEST ALERT\n{kick_url}")
     return f"sent: {status}", 200
+
 
 @app.get("/debug")
 def debug():
@@ -145,10 +161,18 @@ def debug():
     except Exception as e:
         return {"error": repr(e)}, 500
 
-# ---------- Loop state ----------
+
+# Optional: so your Redirect URL doesn't 404 (not needed for client_credentials, but harmless)
+@app.get("/callback")
+def callback():
+    return {"ok": True, "note": "callback endpoint exists (not used in client_credentials)"}, 200
+
+
+# ------------------- LOOP STATE -------------------
 announced_this_session = False
 offline_since = None
 last_session_key = None
+
 
 def bot_loop():
     global announced_this_session, offline_since, last_session_key
@@ -163,13 +187,14 @@ def bot_loop():
             now = time.time()
 
             if is_live:
+                # if it was offline for long enough -> allow new announce
                 if offline_since and (now - offline_since >= OFFLINE_RESET_SECONDS):
                     announced_this_session = False
                     last_session_key = None
 
                 offline_since = None
 
-                # announce once per live session
+                # announce once per live session (or if session_key changes)
                 if (not announced_this_session) or (session_key and session_key != last_session_key):
                     print("DEBUG sending discord alert...")
                     send_discord(content, embed)
@@ -185,6 +210,7 @@ def bot_loop():
             print("Bot error:", repr(e))
 
         time.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
