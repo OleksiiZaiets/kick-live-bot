@@ -2,7 +2,7 @@ import os
 import time
 import threading
 import requests
-from flask import Flask, request
+from flask import Flask
 
 # ------------------- ENV -------------------
 KICK_USERNAME = os.getenv("KICK_USERNAME", "").strip()
@@ -31,11 +31,18 @@ _kick_token_exp = 0  # epoch seconds
 # ------------------- /test cooldown -------------------
 _last_test_at = 0.0
 
+# ------------------- status debug -------------------
+last_poll = 0
+last_error = ""
+last_live = None
+
+# ------------------- LOOP STATE -------------------
+announced_this_session = False
+offline_since = None
+last_session_key = None
+
 
 def get_app_token() -> str:
-    """
-    App Access Token (client_credentials)
-    """
     global _kick_token, _kick_token_exp
 
     now = time.time()
@@ -66,9 +73,6 @@ def get_app_token() -> str:
 
 
 def fetch_channel_official():
-    """
-    Official Kick Public API: GET /public/v1/channels?slug=...
-    """
     token = get_app_token()
     url = "https://api.kick.com/public/v1/channels"
     params = {"slug": KICK_USERNAME}
@@ -96,39 +100,44 @@ def ping_prefix() -> str:
 
 def send_discord(content: str, embed: dict | None = None) -> int:
     """
-    Sends a Discord webhook message.
-    - Adds headers
-    - Retries once on 429 with backoff
+    Sends a Discord webhook message with:
+    - headers
+    - retry/backoff for 429 and Cloudflare 1015 HTML pages
     """
     payload = {"content": content}
     if embed:
         payload["embeds"] = [embed]
 
     headers = {
-        "User-Agent": "kick-live-bot/1.0 (+https://kick-live-bot.onrender.com)",
+        "User-Agent": "kick-live-bot/1.0",
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
 
-    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, headers=headers, timeout=20)
+    def _post():
+        return requests.post(DISCORD_WEBHOOK_URL, json=payload, headers=headers, timeout=20)
 
-    # Rate limited
+    r = _post()
+
+    # Rate limited (Discord 429 JSON or Cloudflare 1015 HTML)
     if r.status_code == 429:
-        retry_after = 10.0
-        # Discord normally returns JSON with retry_after;
-        # Cloudflare pages are HTML, so json() may fail.
+        retry_after = 30.0
+        text = (r.text or "")[:500]
+
         try:
             js = r.json()
             retry_after = float(js.get("retry_after", retry_after))
         except Exception:
-            pass
+            # Cloudflare page often includes these phrases
+            if "Error 1015" in text or "You are being rate limited" in text or "Access denied" in text:
+                retry_after = 300.0  # 5 minutes
 
-        print(f"DEBUG Discord 429. Sleeping {retry_after}s then retrying once...")
+        print(f"DEBUG Discord 429. Sleeping {retry_after}s then retrying once...", flush=True)
         time.sleep(retry_after)
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, headers=headers, timeout=20)
+        r = _post()
 
     if r.status_code >= 400:
-        raise RuntimeError(f"Discord webhook error {r.status_code}: {r.text[:300]}")
+        raise RuntimeError(f"Discord webhook error {r.status_code}: {(r.text or '')[:300]}")
 
     return r.status_code
 
@@ -137,7 +146,7 @@ def build_message(channel: dict):
     stream = channel.get("stream") or {}
     is_live = bool(stream.get("is_live"))
 
-    # ✅ IMPORTANT: session_key only if live (so no "0001-01-01...")
+    # session_key only if live (avoid "0001-01-01..." confusion)
     session_key = (stream.get("start_time") or "").strip() if is_live else None
 
     title = (channel.get("stream_title") or "").strip()
@@ -173,11 +182,18 @@ def health():
     return {"status": "ok", "kick_username": KICK_USERNAME}, 200
 
 
+@app.get("/status")
+def status():
+    return {
+        "last_poll": last_poll,
+        "last_error": last_error,
+        "last_live": last_live,
+        "check_interval": CHECK_INTERVAL,
+    }, 200
+
+
 @app.get("/test")
 def test():
-    """
-    Test webhook with cooldown to avoid accidental spamming / extending rate limits.
-    """
     global _last_test_at
     now = time.time()
 
@@ -188,8 +204,23 @@ def test():
 
     try:
         kick_url = f"https://kick.com/{KICK_USERNAME}"
-        status = send_discord(f"{ping_prefix()}🧪 TEST ALERT\n{kick_url}")
-        return {"ok": True, "sent_status": status}, 200
+        status_code = send_discord(f"{ping_prefix()}🧪 TEST ALERT\n{kick_url}")
+        return {"ok": True, "sent_status": status_code}, 200
+    except Exception as e:
+        return {"ok": False, "error": repr(e)}, 500
+
+
+@app.get("/force")
+def force():
+    """
+    Forces sending the LIVE embed regardless of session logic.
+    If the channel is offline, it will still send a message (use carefully).
+    """
+    try:
+        ch = fetch_channel_official()
+        _, _, content, embed = build_message(ch)
+        status_code = send_discord(content, embed)
+        return {"ok": True, "status": status_code}, 200
     except Exception as e:
         return {"ok": False, "error": repr(e)}, 500
 
@@ -207,49 +238,47 @@ def debug():
             "viewer_count": stream.get("viewer_count", 0) or 0,
             "stream_title": ch.get("stream_title") or "",
             "category": (ch.get("category") or {}).get("name") or "",
-            # ✅ show start_time only if live (avoids "0001-01-01..." confusion)
             "start_time": stream.get("start_time") if is_live else None,
         }, 200
     except Exception as e:
         return {"error": repr(e)}, 500
 
 
-# Optional: so your Redirect URL doesn't 404 (not needed for client_credentials, but harmless)
 @app.get("/callback")
 def callback():
     return {"ok": True, "note": "callback endpoint exists (not used in client_credentials)"}, 200
 
 
-# ------------------- LOOP STATE -------------------
-announced_this_session = False
-offline_since = None
-last_session_key = None
-
-
+# ------------------- BOT LOOP -------------------
 def bot_loop():
     global announced_this_session, offline_since, last_session_key
+    global last_poll, last_error, last_live
 
     while True:
         try:
             ch = fetch_channel_official()
             is_live, session_key, content, embed = build_message(ch)
 
-            print("DEBUG is_live:", is_live, "session_key:", session_key)
+            last_poll = int(time.time())
+            last_live = is_live
+            last_error = ""
+
+            print("DEBUG is_live:", is_live, "session_key:", session_key, flush=True)
 
             now = time.time()
 
             if is_live:
-                # if it was offline for long enough -> allow new announce
                 if offline_since and (now - offline_since >= OFFLINE_RESET_SECONDS):
                     announced_this_session = False
                     last_session_key = None
 
                 offline_since = None
 
-                # announce once per live session (or if session_key changes)
                 if (not announced_this_session) or (session_key and session_key != last_session_key):
-                    print("DEBUG sending discord alert...")
-                    send_discord(content, embed)
+                    print("DEBUG sending discord alert...", flush=True)
+                    status_code = send_discord(content, embed)
+                    print("DEBUG discord sent status:", status_code, flush=True)
+
                     announced_this_session = True
                     last_session_key = session_key
             else:
@@ -259,11 +288,15 @@ def bot_loop():
                 last_session_key = None
 
         except Exception as e:
-            print("Bot error:", repr(e))
+            last_poll = int(time.time())
+            last_error = repr(e)
+            print("Bot error:", repr(e), flush=True)
 
         time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
+    print("BOOT: starting bot thread...", flush=True)
     threading.Thread(target=bot_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    print("BOOT: starting flask...", flush=True)
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
