@@ -9,6 +9,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 ROLE_ID = os.getenv("ROLE_ID", "").strip()
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 PORT = int(os.getenv("PORT", "10000"))
+OFFLINE_RESET_SECONDS = int(os.getenv("OFFLINE_RESET_SECONDS", "30"))
 
 if not KICK_USERNAME or not DISCORD_WEBHOOK_URL:
     raise SystemExit("Missing env vars: KICK_USERNAME and/or DISCORD_WEBHOOK_URL")
@@ -19,14 +20,26 @@ app = Flask(__name__)
 def home():
     return "kick-live-bot is running", 200
 
-was_live = False
-last_live_id = None
+# ✅ TEST ENDPOINT
+@app.get("/test")
+def test():
+    kick_url = f"https://kick.com/{KICK_USERNAME}"
+    ping = f"<@&{ROLE_ID}> " if ROLE_ID else ""
+    payload = {"content": f"{ping}🧪 TEST ALERT\n{kick_url}"}
+    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
+    return f"sent: {r.status_code}", 200
+
+
+announced_this_session = False
+offline_since = None
+
 
 def fetch_channel():
     url = f"https://kick.com/api/v2/channels/{KICK_USERNAME}"
     r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
     r.raise_for_status()
     return r.json()
+
 
 def build_message(data: dict):
     livestream = data.get("livestream") or {}
@@ -58,13 +71,15 @@ def build_message(data: dict):
 
     return live_id, content, embed
 
+
 def send_discord(content: str, embed: dict):
     payload = {"content": content, "embeds": [embed]}
     r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
     r.raise_for_status()
 
+
 def bot_loop():
-    global was_live, last_live_id
+    global announced_this_session, offline_since
 
     while True:
         try:
@@ -72,22 +87,38 @@ def bot_loop():
             livestream = data.get("livestream")
             is_live = isinstance(livestream, dict) and livestream.get("id") is not None
 
+            # ✅ DEBUG LOG
+            print("DEBUG is_live:", is_live, "live_id:", (livestream or {}).get("id"))
+
+            now = time.time()
+
             if is_live:
                 live_id, content, embed = build_message(data)
 
-                # announce only once per live session
-                if (not was_live) or (live_id and live_id != last_live_id):
+                # If offline long enough → treat as new session
+                if offline_since and (now - offline_since >= OFFLINE_RESET_SECONDS):
+                    announced_this_session = False
+
+                offline_since = None
+
+                # Announce once per session
+                if not announced_this_session:
+                    print("DEBUG sending discord alert...")
                     send_discord(content, embed)
-                    was_live = True
-                    last_live_id = live_id
+                    announced_this_session = True
+
             else:
-                was_live = False
-                last_live_id = None
+                # Start offline timer
+                if offline_since is None:
+                    offline_since = now
+
+                announced_this_session = False
 
         except Exception as e:
             print("Bot error:", repr(e))
 
         time.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
