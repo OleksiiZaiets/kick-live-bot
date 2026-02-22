@@ -28,6 +28,9 @@ app = Flask(__name__)
 _kick_token = None
 _kick_token_exp = 0  # epoch seconds
 
+# ------------------- /test cooldown -------------------
+_last_test_at = 0.0
+
 
 def get_app_token() -> str:
     """
@@ -48,7 +51,7 @@ def get_app_token() -> str:
 
     r = requests.post(url, data=data, timeout=20)
     if r.status_code >= 400:
-        raise RuntimeError(f"Kick token error {r.status_code}: {r.text}")
+        raise RuntimeError(f"Kick token error {r.status_code}: {r.text[:300]}")
 
     js = r.json()
     token = js.get("access_token")
@@ -69,11 +72,15 @@ def fetch_channel_official():
     token = get_app_token()
     url = "https://api.kick.com/public/v1/channels"
     params = {"slug": KICK_USERNAME}
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "kick-live-bot/1.0",
+    }
 
     r = requests.get(url, params=params, headers=headers, timeout=20)
     if r.status_code >= 400:
-        raise RuntimeError(f"Kick API error {r.status_code}: {r.text}")
+        raise RuntimeError(f"Kick API error {r.status_code}: {r.text[:300]}")
 
     js = r.json()
     data = js.get("data") or []
@@ -88,13 +95,41 @@ def ping_prefix() -> str:
 
 
 def send_discord(content: str, embed: dict | None = None) -> int:
+    """
+    Sends a Discord webhook message.
+    - Adds headers
+    - Retries once on 429 with backoff
+    """
     payload = {"content": content}
     if embed:
         payload["embeds"] = [embed]
 
-    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
+    headers = {
+        "User-Agent": "kick-live-bot/1.0 (+https://kick-live-bot.onrender.com)",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, headers=headers, timeout=20)
+
+    # Rate limited
+    if r.status_code == 429:
+        retry_after = 10.0
+        # Discord normally returns JSON with retry_after;
+        # Cloudflare pages are HTML, so json() may fail.
+        try:
+            js = r.json()
+            retry_after = float(js.get("retry_after", retry_after))
+        except Exception:
+            pass
+
+        print(f"DEBUG Discord 429. Sleeping {retry_after}s then retrying once...")
+        time.sleep(retry_after)
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, headers=headers, timeout=20)
+
     if r.status_code >= 400:
-        raise RuntimeError(f"Discord webhook error {r.status_code}: {r.text}")
+        raise RuntimeError(f"Discord webhook error {r.status_code}: {r.text[:300]}")
+
     return r.status_code
 
 
@@ -140,9 +175,23 @@ def health():
 
 @app.get("/test")
 def test():
-    kick_url = f"https://kick.com/{KICK_USERNAME}"
-    status = send_discord(f"{ping_prefix()}🧪 TEST ALERT\n{kick_url}")
-    return f"sent: {status}", 200
+    """
+    Test webhook with cooldown to avoid accidental spamming / extending rate limits.
+    """
+    global _last_test_at
+    now = time.time()
+
+    if now - _last_test_at < 60:
+        return {"ok": False, "error": "Test cooldown 60s. Try again later."}, 429
+
+    _last_test_at = now
+
+    try:
+        kick_url = f"https://kick.com/{KICK_USERNAME}"
+        status = send_discord(f"{ping_prefix()}🧪 TEST ALERT\n{kick_url}")
+        return {"ok": True, "sent_status": status}, 200
+    except Exception as e:
+        return {"ok": False, "error": repr(e)}, 500
 
 
 @app.get("/debug")
@@ -150,13 +199,16 @@ def debug():
     try:
         ch = fetch_channel_official()
         stream = ch.get("stream") or {}
+        is_live = bool(stream.get("is_live"))
+
         return {
             "kick_username": KICK_USERNAME,
-            "is_live": bool(stream.get("is_live")),
-            "start_time": stream.get("start_time"),
-            "viewer_count": stream.get("viewer_count"),
-            "stream_title": ch.get("stream_title"),
-            "category": (ch.get("category") or {}).get("name"),
+            "is_live": is_live,
+            "viewer_count": stream.get("viewer_count", 0) or 0,
+            "stream_title": ch.get("stream_title") or "",
+            "category": (ch.get("category") or {}).get("name") or "",
+            # ✅ show start_time only if live (avoids "0001-01-01..." confusion)
+            "start_time": stream.get("start_time") if is_live else None,
         }, 200
     except Exception as e:
         return {"error": repr(e)}, 500
